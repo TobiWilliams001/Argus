@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Python
+embedder/venv/
+embedder/data/
+embedder/__pycache__/
+*.pyc
+
+# Go
+backend/main
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build
+frontend/dist/
