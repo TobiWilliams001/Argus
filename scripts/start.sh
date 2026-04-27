@@ -111,8 +111,8 @@ if [ "$OLLAMA" = true ]; then
   if ! pgrep -x "ollama" > /dev/null; then
     ollama serve &>/dev/null &
     sleep 2
-    log "Pulling llama3.2 (2GB)... this may take a while."
-    ollama list 2>/dev/null | grep -q "llama3.2" || ollama pull llama3.2 || warn "Model pull failed (network issue), synthesis may be disabled."
+    log "Pulling tinyllama (637MB)... this may take a while."
+    ollama list 2>/dev/null | grep -q "tinyllama" || ollama pull tinyllama || warn "Model pull failed (network issue), synthesis may be disabled."
     ok "Ollama ready"
   else
     ok "Ollama already running"
