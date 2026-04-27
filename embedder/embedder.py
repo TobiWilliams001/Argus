@@ -42,7 +42,7 @@ DB_PATH  = DATA_DIR / "argus.db"
 KEY_FILE = DATA_DIR / ".key"
 
 OLLAMA_URL    = "http://localhost:11434"
-OLLAMA_MODEL  = os.getenv("ARGUS_MODEL", "llama3.2")
+OLLAMA_MODEL  = os.getenv("ARGUS_MODEL", "tinyllama")
 CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 EMBED_DIM     = 384
@@ -94,6 +94,15 @@ def init_db():
         annotation    TEXT DEFAULT '',
         query         TEXT DEFAULT '',
         created_at    INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_prefs (
+        user_id      TEXT PRIMARY KEY,
+        onboarded    INTEGER DEFAULT 0,
+        vertical     TEXT DEFAULT '',
+        display_name TEXT DEFAULT '',
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
     );
     """)
 
@@ -315,42 +324,61 @@ def delete_source(store: dict, source: str):
 # ═══════════════════════════════════════════════════════════════
 
 def synthesise(query: str, chunks: list[dict], history: list[dict] = None) -> str:
-    context = "\n\n---\n\n".join(
-        f"[from: {c['source']}]\n{c['text']}" for c in chunks
-    )
+    import re as _re
 
-    # Build conversation string from history
-    history_str = ""
-    if history:
-        for turn in history[-6:]:   # last 6 turns max
-            role = "User" if turn["role"] == "user" else "Argus"
-            history_str += f"{role}: {turn['content']}\n"
+    def clean(text):
+        text = _re.sub(r'#+\s*', '', text)
+        text = _re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+        return text.strip()
+
+    # Take top 3 chunks for more context
+    top = chunks[:3]
+    
+    # Create a numbered context for citations
+    context_blocks = []
+    for i, c in enumerate(top):
+        context_blocks.append(f"Source [{i+1}] ({c['source']}): {clean(c['text'])}")
+    
+    context_str = "\n\n".join(context_blocks)
 
     prompt = (
-        "You are Argus, a precise document intelligence engine. "
-        "Answer using ONLY the provided document excerpts. "
-        "Be concise. Cite source names. "
-        "If absent from excerpts, say so.\n\n"
-        f"EXCERPTS:\n{context}\n\n"
-        + (f"CONVERSATION SO FAR:\n{history_str}\n" if history_str else "")
-        + f"User: {query}\nArgus:"
+        f"You are a research assistant. Answer the question using ONLY the provided sources.\n"
+        f"Use numbered citations like [1] or [2] in your answer to show which source you are using.\n"
+        f"Keep it to 2-3 detailed sentences.\n\n"
+        f"{context_str}\n\n"
+        f"Question: {query}\n"
+        f"Answer:"
     )
 
     try:
         r = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
-                "model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 500}
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.0, 
+                    "num_predict": 300, 
+                    "stop": ["\n\n", "Question:", "Source ["]
+                }
             },
             timeout=60
         )
         r.raise_for_status()
-        return r.json().get("response", "").strip()
-    except requests.exceptions.ConnectionError:
-        return f"[Ollama offline] Best match: {chunks[0]['text'][:400]}"
+        answer = r.json().get("response", "").strip()
+        
+        # Validation: If the model failed to cite or gave a tiny answer, fall back
+        if len(answer) < 20 or "[" not in answer:
+            fallback = f"According to {top[0]['source']}, {clean(top[0]['text'])[:300]}..."
+            return fallback
+            
+        return answer
     except Exception as e:
-        return f"LLM error: {e}"
+        return f"Synthesis error: {e}. Best match: {clean(top[0]['text'])[:300]}"
+
+
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -653,6 +681,107 @@ def reset():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ROUTES — USER PREFS + ONBOARDING
+# ═══════════════════════════════════════════════════════════════
+
+@app.route("/prefs", methods=["GET"])
+def get_prefs():
+    """
+    Returns the user's preferences and onboarding status.
+    If the user doesn't exist yet, returns onboarded: false
+    so the frontend knows to show the welcome screen.
+    """
+    user_id = request.args.get("user_id", "default")
+    con     = db()
+    row     = con.execute(
+        "SELECT * FROM user_prefs WHERE user_id=?", (user_id,)
+    ).fetchone()
+    con.close()
+
+    if not row:
+        return jsonify({
+            "user_id":      user_id,
+            "onboarded":    False,
+            "vertical":     "",
+            "display_name": ""
+        })
+
+    return jsonify({
+        "user_id":      row["user_id"],
+        "onboarded":    bool(row["onboarded"]),
+        "vertical":     row["vertical"],
+        "display_name": row["display_name"]
+    })
+
+
+@app.route("/prefs", methods=["POST"])
+def save_prefs():
+    """
+    Called when user completes onboarding.
+    Saves their vertical choice and name.
+    Also creates their default collection automatically
+    so they land directly in a working workspace.
+    """
+    d            = request.get_json()
+    user_id      = d.get("user_id", "default")
+    vertical     = d.get("vertical", "")
+    display_name = d.get("display_name", "")
+    now          = int(time.time())
+
+    con = db()
+
+    # upsert prefs
+    con.execute("""
+        INSERT INTO user_prefs (user_id, onboarded, vertical, display_name, created_at, updated_at)
+        VALUES (?, 1, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            onboarded    = 1,
+            vertical     = excluded.vertical,
+            display_name = excluded.display_name,
+            updated_at   = excluded.updated_at
+    """, (user_id, vertical, display_name, now, now))
+
+    # auto-create a default collection named after their vertical
+    # so they land in a real workspace immediately
+    import uuid
+    vertical_names = {
+        "research": "My Research",
+        "finance":  "Financial Docs",
+        "legal":    "Case Files",
+        "general":  "My Documents"
+    }
+    col_name  = vertical_names.get(vertical, "My Documents")
+    col_id    = str(uuid.uuid4())[:8]
+    col_color = {
+        "research": "#a78bfa",
+        "finance":  "#34d399",
+        "legal":    "#f59e0b",
+        "general":  "#c8f060"
+    }.get(vertical, "#c8f060")
+
+    # only create if they don't already have one
+    existing = con.execute(
+        "SELECT id FROM collections WHERE user_id=? LIMIT 1", (user_id,)
+    ).fetchone()
+
+    if not existing:
+        con.execute(
+            "INSERT INTO collections VALUES (?,?,?,?,?)",
+            (col_id, user_id, col_name, col_color, now)
+        )
+
+    con.commit()
+    con.close()
+
+    return jsonify({
+        "status":       "onboarded",
+        "vertical":     vertical,
+        "display_name": display_name,
+        "collection_id": col_id if not existing else existing["id"]
+    })
 
 
 if __name__ == "__main__":

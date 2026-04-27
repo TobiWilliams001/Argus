@@ -46,6 +46,9 @@ func main() {
 	mux.HandleFunc("/api/saves",          handleSaves)
 	mux.HandleFunc("/api/saves/",         handleSaveItem)
 
+	// onboarding + prefs
+	mux.HandleFunc("/api/prefs", handlePrefs)
+
 	handler := cors.New(cors.Options{
 		AllowedOrigins: []string{"http://localhost:3000", "http://localhost:5173"},
 		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
@@ -256,5 +259,14 @@ func handleSaveItem(w http.ResponseWriter, r *http.Request) {
 		proxyDelete(w, EMBEDDER_URL+"/saves/"+id+queryString(r))
 	case http.MethodPatch:
 		proxyPatch(w, r, EMBEDDER_URL+"/saves/"+id)
+	}
+}
+
+func handlePrefs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		proxyGet(w, EMBEDDER_URL+"/prefs"+queryString(r))
+	case http.MethodPost:
+		proxyJSON(w, r, EMBEDDER_URL+"/prefs")
 	}
 }
