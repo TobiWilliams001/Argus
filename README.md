@@ -1,8 +1,16 @@
-# ARGUS — Local Intelligence Engine
+# 👁️ Argus — Fully Private Local Semantic Search & RAG Engine
 
-A private semantic search engine that runs entirely on your machine.
-Ingest documents, crawl websites, ask questions in plain English. Get direct answers with citations.
-No cloud. No API keys. Your data never leaves your computer.
+A production-ready, local-first search and Retrieval-Augmented Generation (RAG) platform that runs entirely on your machine. Ingest documents, crawl websites, and query your knowledge base in plain English with zero data leakage, no cloud dependencies, and no API keys.
+
+![Argus Dashboard Mockup](docs/images/argus_dashboard_mockup.png)
+
+---
+
+## Motivation
+
+Most modern AI search and RAG platforms rely on cloud-hosted APIs (like OpenAI or Pinecone) to process, embed, and query user data. This means sending proprietary code, sensitive documents, and personal notes to external servers, exposing organizations and individuals to serious data privacy risks, network latency, and mounting API costs. 
+
+I built **Argus** to prove that you do not need the cloud to have a lightning-fast, highly intelligent semantic search engine. By combining Go’s concurrency model for live web crawling, FAISS for instant vector retrieval, and Ollama for local LLM synthesis, Argus runs 100% locally on standard consumer hardware. It keeps your data exactly where it belongs: secure, encrypted, and completely on your machine.
 
 ---
 
@@ -18,8 +26,8 @@ No cloud. No API keys. Your data never leaves your computer.
 │  - PDF upload   │  SSE stream   │  - PDF proxy     │               │  - FAISS index   │
 │  - Live crawler │ ◄──────────── │  - Crawler pkg   │               │  - AES-256-GCM   │
 └─────────────────┘               └──────────────────┘               │  - Ollama LLM    │
-                                                                      │  - Disk persist  │
-                                                                      └──────────────────┘
+                                                                     │  - Disk persist  │
+                                                                     └──────────────────┘
 ```
 
 **The plumbing:**
@@ -98,7 +106,7 @@ npm run dev
 
 ---
 
-## Using Argus
+## Usage
 
 ### Search
 1. Type a question in the search bar
@@ -230,179 +238,32 @@ argus/
     └── start.sh          # One-command startup
 ```
 
-
 ---
 
-## Architecture
+## Contributing
 
-```
-┌─────────────────┐     HTTP      ┌──────────────────┐     HTTP      ┌──────────────────┐
-│   React + Vite  │ ────────────► │   Go Backend     │ ────────────► │  Python Embedder │
-│   :3000         │               │   :8080          │               │  :8081           │
-│                 │               │                  │               │                  │
-│  - Search UI    │               │  - REST API      │               │  - Chunking      │
-│  - Ingest UI    │               │  - CORS          │               │  - Embeddings    │
-│  - Doc list     │               │  - Dir crawler   │               │  - Vector search │
-└─────────────────┘               └──────────────────┘               │  - Ollama LLM    │
-                                                                      └──────────────────┘
-```
+We welcome contributions to Argus! Since Argus is composed of three services (Go, Python, and React), setting up local development is simple:
 
-**The plumbing:**
-- **Chunking**: text split at sentence boundaries with overlap so context isn't lost at edges
-- **Embeddings**: `all-MiniLM-L6-v2` via sentence-transformers — a real 384-dim vector per chunk
-- **Retrieval**: cosine similarity search across the full embedding store
-- **Synthesis**: Ollama running `llama3.2` locally — no OpenAI, fully private
-- **Transport**: Go handles HTTP routing and CORS; Python owns the ML workload
-
----
-
-## Prerequisites
-
-Install these first:
-
-| Tool | Install |
-|------|---------|
-| **Go 1.21+** | https://go.dev/dl |
-| **Python 3.11+** | https://python.org or `brew install python` |
-| **Node.js 18+** | https://nodejs.org |
-| **Ollama** | https://ollama.ai — for LLM synthesis |
-
----
-
-## Quick Start
+### Clone the Repository
 
 ```bash
-# 1. Clone / unzip the project
-cd argus
-
-# 2. One command starts everything
-./scripts/start.sh
-
-# 3. Open browser
-open http://localhost:3000
+git clone https://github.com/TobiWilliams001/Argus.git
+cd Argus
 ```
 
-The first run will:
-- Create a Python virtualenv and install dependencies (~2 min)
-- Download the `all-MiniLM-L6-v2` embedding model (~90MB)
-- Pull `llama3.2` via Ollama (~2GB, one-time)
+### Local Development Flow
 
-After that, startup is ~5 seconds.
+You can run each service individually as described in the **Manual Start** section, or make modifications directly.
 
----
+- **Go Backend**: Navigate to `backend/` and use standard Go toolchain commands.
+- **Python Embedder**: Navigate to `embedder/`, activate the virtual environment, and install dependencies.
+- **React Frontend**: Navigate to `frontend/`, run `npm install`, and use `npm run dev`.
 
-## Manual Start (if you prefer)
+### Submit a Pull Request
 
-**Terminal 1 — Embedder:**
-```bash
-cd embedder
-python3 -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-python3 embedder.py
-```
-
-**Terminal 2 — Go Backend:**
-```bash
-cd backend
-go mod download
-go run main.go
-```
-
-**Terminal 3 — Frontend:**
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
----
-
-## Using Argus
-
-### Ingest text
-1. Click **ingest** tab in the sidebar
-2. Paste any text (article, research paper, notes)
-3. Give it a name (optional)
-4. Click **+ ingest text**
-
-### Ingest a folder
-1. Drop `.txt` or `.md` files into `docs-sample/`
-2. Click **ingest docs/ folder**
-3. All files are chunked and indexed at once
-
-### Search
-1. Type a question in the search bar
-2. Press Enter or click **search**
-3. Argus retrieves the top matching passages and synthesises an answer
-4. Source passages shown below with cosine similarity scores
-
----
-
-## API Endpoints
-
-The Go backend exposes these routes:
-
-| Method | Route | Description |
-|--------|-------|-------------|
-| POST | `/api/ingest` | Ingest text `{ text, source }` |
-| POST | `/api/search` | Search `{ query, top_k }` |
-| GET | `/api/status` | Corpus stats |
-| POST | `/api/ingest-dir` | Ingest all files in `docs-sample/` |
-
----
-
-## Configuration
-
-**Change the LLM model** (`embedder/embedder.py`):
-```python
-OLLAMA_MODEL = "llama3.2"   # or "mistral", "phi3", "gemma2"
-```
-
-**Change chunk size** (`embedder/embedder.py`):
-```python
-CHUNK_SIZE = 500    # characters per chunk
-CHUNK_OVERLAP = 100 # overlap between chunks
-```
-
-**Change number of results** — pass `top_k` in your search request.
-
----
-
-## What to Build Next
-
-This is the foundation. The real Argus adds:
-
-1. **PDF ingestion** — `pypdf` to extract text, then pipe through the same chunking
-2. **Web crawler** — Go goroutines scraping URLs, respecting robots.txt
-3. **Persistent storage** — SQLite for chunks + FAISS index file (survive restarts)
-4. **FAISS ANN index** — replace brute-force cosine with approximate nearest-neighbour at scale
-5. **Encryption layer** — AES-256-GCM on stored chunks (the Sentinel-KV pillar)
-6. **Multi-user isolation** — namespace chunks per user, separate encryption keys
-
----
-
-## Project Structure
-
-```
-argus/
-├── backend/              # Go HTTP server
-│   ├── main.go           # Routes, CORS, request forwarding
-│   └── go.mod
-├── embedder/             # Python ML microservice
-│   ├── embedder.py       # Chunking, embeddings, search, Ollama
-│   └── requirements.txt
-├── frontend/             # React + Vite UI
-│   ├── src/
-│   │   ├── App.jsx       # Main component
-│   │   ├── index.css     # Styles
-│   │   └── main.jsx      # Entry point
-│   ├── index.html
-│   └── package.json
-├── docs-sample/          # Drop your .txt / .md files here
-│   ├── distributed-systems.md
-│   ├── cryptography.md
-│   └── mle-embeddings.md
-└── scripts/
-    └── start.sh          # One-command startup
-```
+If you have a feature request or bug fix:
+1. Fork the repository.
+2. Create a new branch (`git checkout -b feature/amazing-feature`).
+3. Commit your changes.
+4. Push to the branch (`git push origin feature/amazing-feature`).
+5. Open a Pull Request.
