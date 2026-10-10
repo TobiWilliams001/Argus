@@ -8,7 +8,7 @@ New:
   • Multi-user — all state namespaced by user_id
 """
 
-import os, json, time, re, logging, sqlite3
+import io, json, logging, os, re, shutil, sqlite3, time, uuid
 import requests
 import numpy as np
 from pathlib import Path
@@ -51,17 +51,14 @@ ENCRYPT       = os.getenv("ARGUS_ENCRYPT", "true").lower() == "true"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── In-memory index store ─────────────────────────────────────
-# Key: (user_id, collection_id)
-# Value: {"index": faiss_index, "chunks": [...], "matrix": np.ndarray}
+# (user_id, collection_id) -> {"index", "chunks", "matrix"}
 INDEX_STORE: dict = {}
 
 model   = None
 aes_key = None
 
 
-# ═══════════════════════════════════════════════════════════════
-#  DATABASE  (SQLite)
-# ═══════════════════════════════════════════════════════════════
+# ── Database (SQLite) ─────────────────────────────────────────
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
@@ -117,9 +114,7 @@ def db():
     return con
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ENCRYPTION
-# ═══════════════════════════════════════════════════════════════
+# ── Encryption ────────────────────────────────────────────────
 
 def load_or_create_key():
     global aes_key
@@ -145,9 +140,7 @@ def aes_decrypt(data: bytes) -> bytes:
     return AESGCM(aes_key).decrypt(data[:12], data[12:], None)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  INDEX MANAGEMENT  (per collection)
-# ═══════════════════════════════════════════════════════════════
+# ── Index management (one per collection) ─────────────────────
 
 def index_key(user_id: str, collection_id: str) -> tuple:
     return (user_id, collection_id)
@@ -214,9 +207,7 @@ def _rebuild_matrix(store: dict):
     ).astype(np.float32)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  CHUNKING
-# ═══════════════════════════════════════════════════════════════
+# ── Chunking ──────────────────────────────────────────────────
 
 def chunk_text(text: str, source: str, base_idx: int = 0) -> list[dict]:
     text      = re.sub(r'\s+', ' ', text).strip()
@@ -239,9 +230,7 @@ def chunk_text(text: str, source: str, base_idx: int = 0) -> list[dict]:
     return chunks
 
 
-# ═══════════════════════════════════════════════════════════════
-#  EMBED + INDEX
-# ═══════════════════════════════════════════════════════════════
+# ── Embed + index ─────────────────────────────────────────────
 
 def embed_and_index(store: dict, chunks: list[dict]):
     texts = [c["text"] for c in chunks]
@@ -258,9 +247,7 @@ def embed_and_index(store: dict, chunks: list[dict]):
             else np.vstack([store["matrix"], embs])
 
 
-# ═══════════════════════════════════════════════════════════════
-#  RETRIEVAL
-# ═══════════════════════════════════════════════════════════════
+# ── Retrieval ─────────────────────────────────────────────────
 
 def retrieve(store: dict, query: str, top_k: int = 4) -> list[dict]:
     if not store["chunks"]:
@@ -289,19 +276,15 @@ def retrieve(store: dict, query: str, top_k: int = 4) -> list[dict]:
     return []
 
 
-# ═══════════════════════════════════════════════════════════════
-#  DELETE BY SOURCE  (rebuilds FAISS index minus that source)
-# ═══════════════════════════════════════════════════════════════
+# ── Delete by source ──────────────────────────────────────────
 
 def delete_source(store: dict, source: str):
-    """Remove all chunks from a source and rebuild the index."""
+    """Remove all chunks from a source and rebuild the index from the rest."""
     store["chunks"] = [c for c in store["chunks"] if c["source"] != source]
 
-    # Renumber indices
     for i, c in enumerate(store["chunks"]):
         c["idx"] = i
 
-    # Rebuild FAISS from scratch
     store["index"]  = None
     store["matrix"] = None
 
@@ -319,9 +302,7 @@ def delete_source(store: dict, source: str):
         _rebuild_matrix(store)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  LLM SYNTHESIS  (with chat history)
-# ═══════════════════════════════════════════════════════════════
+# ── LLM synthesis ─────────────────────────────────────────────
 
 def synthesise(query: str, chunks: list[dict], history: list[dict] = None) -> str:
     import re as _re
@@ -378,26 +359,18 @@ def synthesise(query: str, chunks: list[dict], history: list[dict] = None) -> st
         return f"Synthesis error: {e}. Best match: {clean(top[0]['text'])[:300]}"
 
 
-
-
-
-# ═══════════════════════════════════════════════════════════════
-#  PDF
-# ═══════════════════════════════════════════════════════════════
+# ── PDF ───────────────────────────────────────────────────────
 
 def extract_pdf_bytes(data: bytes) -> str:
     if not PDF_AVAILABLE:
         raise RuntimeError("pypdf not installed")
-    import io
     reader = PdfReader(io.BytesIO(data))
     return "\n\n".join(
         p.extract_text() for p in reader.pages if p.extract_text()
     )
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — COLLECTIONS
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: collections ───────────────────────────────────────
 
 @app.route("/collections", methods=["GET"])
 def list_collections():
@@ -420,7 +393,6 @@ def create_collection():
     if not name:
         return jsonify({"error": "name required"}), 400
 
-    import uuid
     col_id = str(uuid.uuid4())[:8]
     con    = db()
     con.execute(
@@ -446,7 +418,6 @@ def delete_collection(col_id):
     if key in INDEX_STORE:
         del INDEX_STORE[key]
 
-    import shutil
     d = _collection_dir(user_id, col_id)
     if d.exists():
         shutil.rmtree(d)
@@ -454,9 +425,7 @@ def delete_collection(col_id):
     return jsonify({"status": "deleted"})
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — INGEST
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: ingest ────────────────────────────────────────────
 
 def _ingest_text(text: str, source: str, user_id: str, collection_id: str) -> dict:
     store  = get_store(user_id, collection_id)
@@ -465,7 +434,6 @@ def _ingest_text(text: str, source: str, user_id: str, collection_id: str) -> di
     embed_and_index(store, chunks)
     _persist_collection(user_id, collection_id)
 
-    import uuid
     con = db()
     con.execute(
         "INSERT OR REPLACE INTO documents VALUES (?,?,?,?,?,?)",
@@ -509,9 +477,7 @@ def ingest_pdf():
     return jsonify(_ingest_text(text, source, user_id, collection_id))
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — SEARCH + CHAT
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: search ────────────────────────────────────────────
 
 @app.route("/search", methods=["POST"])
 def search():
@@ -539,9 +505,7 @@ def search():
     return jsonify({"answer": answer, "chunks": chunks, "elapsed": elapsed})
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — DOCUMENTS (source browser)
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: documents ─────────────────────────────────────────
 
 @app.route("/documents", methods=["GET"])
 def list_documents():
@@ -575,9 +539,7 @@ def delete_document(source):
     return jsonify({"status": "deleted", "source": source})
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — SAVES (highlights)
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: saves (highlights) ────────────────────────────────
 
 @app.route("/saves", methods=["GET"])
 def list_saves():
@@ -594,7 +556,6 @@ def list_saves():
 
 @app.route("/saves", methods=["POST"])
 def create_save():
-    import uuid
     d             = request.get_json()
     user_id       = d.get("user_id", "default")
     collection_id = d.get("collection_id", "default")
@@ -636,9 +597,7 @@ def update_save(save_id):
     return jsonify({"status": "updated"})
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — STATUS / RESET
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: status / reset ────────────────────────────────────
 
 @app.route("/status", methods=["GET"])
 def status():
@@ -666,7 +625,6 @@ def reset():
     key           = index_key(user_id, collection_id)
     if key in INDEX_STORE:
         del INDEX_STORE[key]
-    import shutil
     p = _collection_dir(user_id, collection_id)
     if p.exists():
         shutil.rmtree(p)
@@ -683,17 +641,11 @@ def health():
     return jsonify({"status": "ok"})
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — USER PREFS + ONBOARDING
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: user prefs + onboarding ───────────────────────────
 
 @app.route("/prefs", methods=["GET"])
 def get_prefs():
-    """
-    Returns the user's preferences and onboarding status.
-    If the user doesn't exist yet, returns onboarded: false
-    so the frontend knows to show the welcome screen.
-    """
+    """User prefs; unknown users get onboarded=false so the frontend shows the welcome screen."""
     user_id = request.args.get("user_id", "default")
     con     = db()
     row     = con.execute(
@@ -719,12 +671,7 @@ def get_prefs():
 
 @app.route("/prefs", methods=["POST"])
 def save_prefs():
-    """
-    Called when user completes onboarding.
-    Saves their vertical choice and name.
-    Also creates their default collection automatically
-    so they land directly in a working workspace.
-    """
+    """Finish onboarding: save prefs and create a first collection named after the vertical."""
     d            = request.get_json()
     user_id      = d.get("user_id", "default")
     vertical     = d.get("vertical", "")
@@ -733,7 +680,6 @@ def save_prefs():
 
     con = db()
 
-    # upsert prefs
     con.execute("""
         INSERT INTO user_prefs (user_id, onboarded, vertical, display_name, created_at, updated_at)
         VALUES (?, 1, ?, ?, ?, ?)
@@ -744,9 +690,6 @@ def save_prefs():
             updated_at   = excluded.updated_at
     """, (user_id, vertical, display_name, now, now))
 
-    # auto-create a default collection named after their vertical
-    # so they land in a real workspace immediately
-    import uuid
     vertical_names = {
         "research": "My Research",
         "finance":  "Financial Docs",
@@ -762,7 +705,6 @@ def save_prefs():
         "general":  "#c8f060"
     }.get(vertical, "#c8f060")
 
-    # only create if they don't already have one
     existing = con.execute(
         "SELECT id FROM collections WHERE user_id=? LIMIT 1", (user_id,)
     ).fetchone()
@@ -792,5 +734,5 @@ if __name__ == "__main__":
     log.info(f"FAISS:   {'✓' if FAISS_AVAILABLE else '✗'}")
     log.info(f"PDF:     {'✓' if PDF_AVAILABLE else '✗'}")
     log.info(f"Encrypt: {'✓ AES-256-GCM' if CRYPTO_AVAILABLE and ENCRYPT else '✗'}")
-    log.info("Argus embedder v3 → http://localhost:8081")
+    log.info("Argus embedder → http://localhost:8081")
     app.run(host="0.0.0.0", port=8081, debug=False)
