@@ -1,20 +1,18 @@
 """
-Argus Embedder v3
-─────────────────
-New:
-  • Collections — one FAISS index per (user_id, collection_id)
-  • Delete by source — rebuilds index minus deleted source
-  • Chat mode — conversation history forwarded to Ollama
-  • Multi-user — all state namespaced by user_id
+Argus embedder: ingestion, retrieval and answer synthesis behind a small Flask API.
+
+Every collection has its own FAISS index, keyed by (user_id, collection_id).
+Chunking and retrieval live in retrieval.py; the eval suite in eval/ uses the same code.
 """
 
-import io, json, logging, os, re, shutil, sqlite3, time, uuid
+import io, json, logging, os, shutil, sqlite3, time, uuid
 import numpy as np
 from pathlib import Path
 from flask import Flask, request, jsonify
 from sentence_transformers import SentenceTransformer
 
 from llm import OLLAMA_MODEL, synthesise
+from retrieval import BM25, chunk_text, search as search_chunks
 
 try:
     import faiss
@@ -42,15 +40,17 @@ DATA_DIR = Path("./data")
 DB_PATH  = DATA_DIR / "argus.db"
 KEY_FILE = DATA_DIR / ".key"
 
-CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", "500"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
-EMBED_DIM     = 384
-ENCRYPT       = os.getenv("ARGUS_ENCRYPT", "true").lower() == "true"
+CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "500"))
+CHUNK_OVERLAP  = int(os.getenv("CHUNK_OVERLAP", "100"))
+RETRIEVAL_MODE = os.getenv("ARGUS_RETRIEVAL", "hybrid")   # vector | bm25 | hybrid
+RERANK         = os.getenv("ARGUS_RERANK", "true").lower() == "true"
+EMBED_DIM      = 384
+ENCRYPT        = os.getenv("ARGUS_ENCRYPT", "true").lower() == "true"
 
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── In-memory index store ─────────────────────────────────────
-# (user_id, collection_id) -> {"index", "chunks", "matrix"}
+# (user_id, collection_id) -> {"index", "chunks", "matrix", "bm25"}
 INDEX_STORE: dict = {}
 
 model   = None
@@ -149,7 +149,7 @@ def get_store(user_id: str, collection_id: str) -> dict:
     """Get or create the in-memory store for a collection."""
     key = index_key(user_id, collection_id)
     if key not in INDEX_STORE:
-        INDEX_STORE[key] = {"index": None, "chunks": [], "matrix": None}
+        INDEX_STORE[key] = {"index": None, "chunks": [], "matrix": None, "bm25": None}
         _load_collection_from_disk(user_id, collection_id)
     return INDEX_STORE[key]
 
@@ -200,42 +200,19 @@ def _rebuild_matrix(store: dict):
     if not store["chunks"]:
         store["matrix"] = None
         return
-    texts = [c["text"] for c in store["chunks"]]
-    store["matrix"] = model.encode(
-        texts, convert_to_numpy=True, normalize_embeddings=True
-    ).astype(np.float32)
-
-
-# ── Chunking ──────────────────────────────────────────────────
-
-def chunk_text(text: str, source: str, base_idx: int = 0) -> list[dict]:
-    text      = re.sub(r'\s+', ' ', text).strip()
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks, current = [], ""
-
-    for i, sentence in enumerate(sentences):
-        current += sentence + " "
-        if len(current) >= CHUNK_SIZE or i == len(sentences) - 1:
-            stripped = current.strip()
-            if stripped:
-                chunks.append({
-                    "text": stripped,
-                    "source": source,
-                    "idx": base_idx + len(chunks)
-                })
-            words   = current.split()
-            current = " ".join(words[-max(1, CHUNK_OVERLAP // 6):]) + " "
-
-    return chunks
+    store["matrix"] = encode([c["text"] for c in store["chunks"]])
 
 
 # ── Embed + index ─────────────────────────────────────────────
 
+def encode(texts: list[str]) -> np.ndarray:
+    return model.encode(texts, convert_to_numpy=True,
+                        normalize_embeddings=True).astype(np.float32)
+
+
 def embed_and_index(store: dict, chunks: list[dict]):
-    texts = [c["text"] for c in chunks]
-    embs  = model.encode(
-        texts, convert_to_numpy=True, normalize_embeddings=True
-    ).astype(np.float32)
+    embs = encode([c["text"] for c in chunks])
+    store["bm25"] = None
 
     if FAISS_AVAILABLE:
         if store["index"] is None:
@@ -251,28 +228,12 @@ def embed_and_index(store: dict, chunks: list[dict]):
 def retrieve(store: dict, query: str, top_k: int = 4) -> list[dict]:
     if not store["chunks"]:
         return []
-
-    q_emb = model.encode(
-        [query], convert_to_numpy=True, normalize_embeddings=True
-    ).astype(np.float32)
-
-    if FAISS_AVAILABLE and store["index"] is not None:
-        k = min(top_k, store["index"].ntotal)
-        scores, indices = store["index"].search(q_emb, k)
-        return [
-            {**store["chunks"][idx], "similarity": round(float(s), 4)}
-            for s, idx in zip(scores[0], indices[0])
-            if idx >= 0 and float(s) > 0.1
-        ]
-
-    if store["matrix"] is not None:
-        scores  = (store["matrix"] @ q_emb.T).flatten()
-        top     = np.argsort(scores)[::-1][:top_k]
-        return [
-            {**store["chunks"][i], "similarity": round(float(scores[i]), 4)}
-            for i in top if float(scores[i]) > 0.1
-        ]
-    return []
+    if store.get("bm25") is None and RETRIEVAL_MODE != "vector":
+        store["bm25"] = BM25([c["text"] for c in store["chunks"]])
+    return search_chunks(query, encode([query]), store["chunks"],
+                         index=store["index"] if FAISS_AVAILABLE else None,
+                         matrix=store["matrix"], bm25=store.get("bm25"),
+                         top_k=top_k, mode=RETRIEVAL_MODE, rerank=RERANK)
 
 
 # ── Delete by source ──────────────────────────────────────────
@@ -280,25 +241,19 @@ def retrieve(store: dict, query: str, top_k: int = 4) -> list[dict]:
 def delete_source(store: dict, source: str):
     """Remove all chunks from a source and rebuild the index from the rest."""
     store["chunks"] = [c for c in store["chunks"] if c["source"] != source]
-
     for i, c in enumerate(store["chunks"]):
         c["idx"] = i
 
     store["index"]  = None
     store["matrix"] = None
-
-    if not store["chunks"]:
-        return
-
-    if FAISS_AVAILABLE:
-        store["index"] = faiss.IndexFlatIP(EMBED_DIM)
-        texts = [c["text"] for c in store["chunks"]]
-        embs  = model.encode(
-            texts, convert_to_numpy=True, normalize_embeddings=True
-        ).astype(np.float32)
-        store["index"].add(embs)
-    else:
-        _rebuild_matrix(store)
+    store["bm25"]   = None
+    if store["chunks"]:
+        embs = encode([c["text"] for c in store["chunks"]])
+        if FAISS_AVAILABLE:
+            store["index"] = faiss.IndexFlatIP(EMBED_DIM)
+            store["index"].add(embs)
+        else:
+            store["matrix"] = embs
 
 
 # ── PDF ───────────────────────────────────────────────────────
@@ -371,7 +326,8 @@ def delete_collection(col_id):
 
 def _ingest_text(text: str, source: str, user_id: str, collection_id: str) -> dict:
     store  = get_store(user_id, collection_id)
-    chunks = chunk_text(text, source, base_idx=len(store["chunks"]))
+    chunks = chunk_text(text, source, base_idx=len(store["chunks"]),
+                        size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
     store["chunks"].extend(chunks)
     embed_and_index(store, chunks)
     _persist_collection(user_id, collection_id)
@@ -675,5 +631,6 @@ if __name__ == "__main__":
     log.info(f"FAISS:   {'✓' if FAISS_AVAILABLE else '✗'}")
     log.info(f"PDF:     {'✓' if PDF_AVAILABLE else '✗'}")
     log.info(f"Encrypt: {'✓ AES-256-GCM' if CRYPTO_AVAILABLE and ENCRYPT else '✗'}")
+    log.info(f"Search:  {RETRIEVAL_MODE}{' + rerank' if RERANK else ''}")
     log.info("Argus embedder → http://localhost:8081")
     app.run(host="0.0.0.0", port=8081, debug=False)
