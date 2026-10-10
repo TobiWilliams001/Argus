@@ -25,3 +25,6 @@ npm-debug.log*
 
 # Build
 frontend/dist/
+
+# Eval
+eval/data/
