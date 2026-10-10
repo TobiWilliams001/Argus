@@ -9,11 +9,12 @@ New:
 """
 
 import io, json, logging, os, re, shutil, sqlite3, time, uuid
-import requests
 import numpy as np
 from pathlib import Path
 from flask import Flask, request, jsonify
 from sentence_transformers import SentenceTransformer
+
+from llm import OLLAMA_MODEL, synthesise
 
 try:
     import faiss
@@ -41,8 +42,6 @@ DATA_DIR = Path("./data")
 DB_PATH  = DATA_DIR / "argus.db"
 KEY_FILE = DATA_DIR / ".key"
 
-OLLAMA_URL    = "http://localhost:11434"
-OLLAMA_MODEL  = os.getenv("ARGUS_MODEL", "tinyllama")
 CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 EMBED_DIM     = 384
@@ -302,63 +301,6 @@ def delete_source(store: dict, source: str):
         _rebuild_matrix(store)
 
 
-# ── LLM synthesis ─────────────────────────────────────────────
-
-def synthesise(query: str, chunks: list[dict], history: list[dict] = None) -> str:
-    import re as _re
-
-    def clean(text):
-        text = _re.sub(r'#+\s*', '', text)
-        text = _re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-        return text.strip()
-
-    # Take top 3 chunks for more context
-    top = chunks[:3]
-    
-    # Create a numbered context for citations
-    context_blocks = []
-    for i, c in enumerate(top):
-        context_blocks.append(f"Source [{i+1}] ({c['source']}): {clean(c['text'])}")
-    
-    context_str = "\n\n".join(context_blocks)
-
-    prompt = (
-        f"You are a research assistant. Answer the question using ONLY the provided sources.\n"
-        f"Use numbered citations like [1] or [2] in your answer to show which source you are using.\n"
-        f"Keep it to 2-3 detailed sentences.\n\n"
-        f"{context_str}\n\n"
-        f"Question: {query}\n"
-        f"Answer:"
-    )
-
-    try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.0, 
-                    "num_predict": 300, 
-                    "stop": ["\n\n", "Question:", "Source ["]
-                }
-            },
-            timeout=60
-        )
-        r.raise_for_status()
-        answer = r.json().get("response", "").strip()
-        
-        # Validation: If the model failed to cite or gave a tiny answer, fall back
-        if len(answer) < 20 or "[" not in answer:
-            fallback = f"According to {top[0]['source']}, {clean(top[0]['text'])[:300]}..."
-            return fallback
-            
-        return answer
-    except Exception as e:
-        return f"Synthesis error: {e}. Best match: {clean(top[0]['text'])[:300]}"
-
-
 # ── PDF ───────────────────────────────────────────────────────
 
 def extract_pdf_bytes(data: bytes) -> str:
@@ -486,7 +428,6 @@ def search():
     user_id       = d.get("user_id", "default")
     collection_id = d.get("collection_id", "default")
     top_k         = int(d.get("top_k", 4))
-    history       = d.get("history", [])   # list of {role, content}
 
     if not query:
         return jsonify({"error": "query required"}), 400
@@ -500,7 +441,7 @@ def search():
     if not chunks:
         return jsonify({"answer": "Nothing relevant found.", "chunks": [], "elapsed": "0ms"})
 
-    answer  = synthesise(query, chunks, history)
+    answer  = synthesise(query, chunks)
     elapsed = f"{int((time.time() - t0) * 1000)}ms"
     return jsonify({"answer": answer, "chunks": chunks, "elapsed": elapsed})
 
