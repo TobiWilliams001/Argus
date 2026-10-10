@@ -1,19 +1,18 @@
 """
-Argus Embedder v3
-─────────────────
-New:
-  • Collections — one FAISS index per (user_id, collection_id)
-  • Delete by source — rebuilds index minus deleted source
-  • Chat mode — conversation history forwarded to Ollama
-  • Multi-user — all state namespaced by user_id
+Argus embedder: ingestion, retrieval and answer synthesis behind a small Flask API.
+
+Every collection has its own FAISS index, keyed by (user_id, collection_id).
+Chunking and retrieval live in retrieval.py; the eval suite in eval/ uses the same code.
 """
 
-import os, json, time, re, logging, sqlite3
-import requests
+import io, json, logging, os, shutil, sqlite3, time, uuid
 import numpy as np
 from pathlib import Path
 from flask import Flask, request, jsonify
 from sentence_transformers import SentenceTransformer
+
+from llm import OLLAMA_MODEL, synthesise
+from retrieval import BM25, chunk_text, search as search_chunks
 
 try:
     import faiss
@@ -41,27 +40,24 @@ DATA_DIR = Path("./data")
 DB_PATH  = DATA_DIR / "argus.db"
 KEY_FILE = DATA_DIR / ".key"
 
-OLLAMA_URL    = "http://localhost:11434"
-OLLAMA_MODEL  = os.getenv("ARGUS_MODEL", "tinyllama")
-CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", "500"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
-EMBED_DIM     = 384
-ENCRYPT       = os.getenv("ARGUS_ENCRYPT", "true").lower() == "true"
+CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "500"))
+CHUNK_OVERLAP  = int(os.getenv("CHUNK_OVERLAP", "100"))
+RETRIEVAL_MODE = os.getenv("ARGUS_RETRIEVAL", "hybrid")   # vector | bm25 | hybrid
+RERANK         = os.getenv("ARGUS_RERANK", "true").lower() == "true"
+EMBED_DIM      = 384
+ENCRYPT        = os.getenv("ARGUS_ENCRYPT", "true").lower() == "true"
 
 DATA_DIR.mkdir(exist_ok=True)
 
 # ── In-memory index store ─────────────────────────────────────
-# Key: (user_id, collection_id)
-# Value: {"index": faiss_index, "chunks": [...], "matrix": np.ndarray}
+# (user_id, collection_id) -> {"index", "chunks", "matrix", "bm25"}
 INDEX_STORE: dict = {}
 
 model   = None
 aes_key = None
 
 
-# ═══════════════════════════════════════════════════════════════
-#  DATABASE  (SQLite)
-# ═══════════════════════════════════════════════════════════════
+# ── Database (SQLite) ─────────────────────────────────────────
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
@@ -117,9 +113,7 @@ def db():
     return con
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ENCRYPTION
-# ═══════════════════════════════════════════════════════════════
+# ── Encryption ────────────────────────────────────────────────
 
 def load_or_create_key():
     global aes_key
@@ -145,9 +139,7 @@ def aes_decrypt(data: bytes) -> bytes:
     return AESGCM(aes_key).decrypt(data[:12], data[12:], None)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  INDEX MANAGEMENT  (per collection)
-# ═══════════════════════════════════════════════════════════════
+# ── Index management (one per collection) ─────────────────────
 
 def index_key(user_id: str, collection_id: str) -> tuple:
     return (user_id, collection_id)
@@ -157,7 +149,7 @@ def get_store(user_id: str, collection_id: str) -> dict:
     """Get or create the in-memory store for a collection."""
     key = index_key(user_id, collection_id)
     if key not in INDEX_STORE:
-        INDEX_STORE[key] = {"index": None, "chunks": [], "matrix": None}
+        INDEX_STORE[key] = {"index": None, "chunks": [], "matrix": None, "bm25": None}
         _load_collection_from_disk(user_id, collection_id)
     return INDEX_STORE[key]
 
@@ -208,46 +200,19 @@ def _rebuild_matrix(store: dict):
     if not store["chunks"]:
         store["matrix"] = None
         return
-    texts = [c["text"] for c in store["chunks"]]
-    store["matrix"] = model.encode(
-        texts, convert_to_numpy=True, normalize_embeddings=True
-    ).astype(np.float32)
+    store["matrix"] = encode([c["text"] for c in store["chunks"]])
 
 
-# ═══════════════════════════════════════════════════════════════
-#  CHUNKING
-# ═══════════════════════════════════════════════════════════════
+# ── Embed + index ─────────────────────────────────────────────
 
-def chunk_text(text: str, source: str, base_idx: int = 0) -> list[dict]:
-    text      = re.sub(r'\s+', ' ', text).strip()
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    chunks, current = [], ""
+def encode(texts: list[str]) -> np.ndarray:
+    return model.encode(texts, convert_to_numpy=True,
+                        normalize_embeddings=True).astype(np.float32)
 
-    for i, sentence in enumerate(sentences):
-        current += sentence + " "
-        if len(current) >= CHUNK_SIZE or i == len(sentences) - 1:
-            stripped = current.strip()
-            if stripped:
-                chunks.append({
-                    "text": stripped,
-                    "source": source,
-                    "idx": base_idx + len(chunks)
-                })
-            words   = current.split()
-            current = " ".join(words[-max(1, CHUNK_OVERLAP // 6):]) + " "
-
-    return chunks
-
-
-# ═══════════════════════════════════════════════════════════════
-#  EMBED + INDEX
-# ═══════════════════════════════════════════════════════════════
 
 def embed_and_index(store: dict, chunks: list[dict]):
-    texts = [c["text"] for c in chunks]
-    embs  = model.encode(
-        texts, convert_to_numpy=True, normalize_embeddings=True
-    ).astype(np.float32)
+    embs = encode([c["text"] for c in chunks])
+    store["bm25"] = None
 
     if FAISS_AVAILABLE:
         if store["index"] is None:
@@ -258,146 +223,51 @@ def embed_and_index(store: dict, chunks: list[dict]):
             else np.vstack([store["matrix"], embs])
 
 
-# ═══════════════════════════════════════════════════════════════
-#  RETRIEVAL
-# ═══════════════════════════════════════════════════════════════
+# ── Retrieval ─────────────────────────────────────────────────
 
 def retrieve(store: dict, query: str, top_k: int = 4) -> list[dict]:
     if not store["chunks"]:
         return []
-
-    q_emb = model.encode(
-        [query], convert_to_numpy=True, normalize_embeddings=True
-    ).astype(np.float32)
-
-    if FAISS_AVAILABLE and store["index"] is not None:
-        k = min(top_k, store["index"].ntotal)
-        scores, indices = store["index"].search(q_emb, k)
-        return [
-            {**store["chunks"][idx], "similarity": round(float(s), 4)}
-            for s, idx in zip(scores[0], indices[0])
-            if idx >= 0 and float(s) > 0.1
-        ]
-
-    if store["matrix"] is not None:
-        scores  = (store["matrix"] @ q_emb.T).flatten()
-        top     = np.argsort(scores)[::-1][:top_k]
-        return [
-            {**store["chunks"][i], "similarity": round(float(scores[i]), 4)}
-            for i in top if float(scores[i]) > 0.1
-        ]
-    return []
+    if store.get("bm25") is None and RETRIEVAL_MODE != "vector":
+        store["bm25"] = BM25([c["text"] for c in store["chunks"]])
+    return search_chunks(query, encode([query]), store["chunks"],
+                         index=store["index"] if FAISS_AVAILABLE else None,
+                         matrix=store["matrix"], bm25=store.get("bm25"),
+                         top_k=top_k, mode=RETRIEVAL_MODE, rerank=RERANK)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  DELETE BY SOURCE  (rebuilds FAISS index minus that source)
-# ═══════════════════════════════════════════════════════════════
+# ── Delete by source ──────────────────────────────────────────
 
 def delete_source(store: dict, source: str):
-    """Remove all chunks from a source and rebuild the index."""
+    """Remove all chunks from a source and rebuild the index from the rest."""
     store["chunks"] = [c for c in store["chunks"] if c["source"] != source]
-
-    # Renumber indices
     for i, c in enumerate(store["chunks"]):
         c["idx"] = i
 
-    # Rebuild FAISS from scratch
     store["index"]  = None
     store["matrix"] = None
-
-    if not store["chunks"]:
-        return
-
-    if FAISS_AVAILABLE:
-        store["index"] = faiss.IndexFlatIP(EMBED_DIM)
-        texts = [c["text"] for c in store["chunks"]]
-        embs  = model.encode(
-            texts, convert_to_numpy=True, normalize_embeddings=True
-        ).astype(np.float32)
-        store["index"].add(embs)
-    else:
-        _rebuild_matrix(store)
+    store["bm25"]   = None
+    if store["chunks"]:
+        embs = encode([c["text"] for c in store["chunks"]])
+        if FAISS_AVAILABLE:
+            store["index"] = faiss.IndexFlatIP(EMBED_DIM)
+            store["index"].add(embs)
+        else:
+            store["matrix"] = embs
 
 
-# ═══════════════════════════════════════════════════════════════
-#  LLM SYNTHESIS  (with chat history)
-# ═══════════════════════════════════════════════════════════════
-
-def synthesise(query: str, chunks: list[dict], history: list[dict] = None) -> str:
-    import re as _re
-
-    def clean(text):
-        text = _re.sub(r'#+\s*', '', text)
-        text = _re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-        return text.strip()
-
-    # Take top 3 chunks for more context
-    top = chunks[:3]
-    
-    # Create a numbered context for citations
-    context_blocks = []
-    for i, c in enumerate(top):
-        context_blocks.append(f"Source [{i+1}] ({c['source']}): {clean(c['text'])}")
-    
-    context_str = "\n\n".join(context_blocks)
-
-    prompt = (
-        f"You are a research assistant. Answer the question using ONLY the provided sources.\n"
-        f"Use numbered citations like [1] or [2] in your answer to show which source you are using.\n"
-        f"Keep it to 2-3 detailed sentences.\n\n"
-        f"{context_str}\n\n"
-        f"Question: {query}\n"
-        f"Answer:"
-    )
-
-    try:
-        r = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.0, 
-                    "num_predict": 300, 
-                    "stop": ["\n\n", "Question:", "Source ["]
-                }
-            },
-            timeout=60
-        )
-        r.raise_for_status()
-        answer = r.json().get("response", "").strip()
-        
-        # Validation: If the model failed to cite or gave a tiny answer, fall back
-        if len(answer) < 20 or "[" not in answer:
-            fallback = f"According to {top[0]['source']}, {clean(top[0]['text'])[:300]}..."
-            return fallback
-            
-        return answer
-    except Exception as e:
-        return f"Synthesis error: {e}. Best match: {clean(top[0]['text'])[:300]}"
-
-
-
-
-
-# ═══════════════════════════════════════════════════════════════
-#  PDF
-# ═══════════════════════════════════════════════════════════════
+# ── PDF ───────────────────────────────────────────────────────
 
 def extract_pdf_bytes(data: bytes) -> str:
     if not PDF_AVAILABLE:
         raise RuntimeError("pypdf not installed")
-    import io
     reader = PdfReader(io.BytesIO(data))
     return "\n\n".join(
         p.extract_text() for p in reader.pages if p.extract_text()
     )
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — COLLECTIONS
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: collections ───────────────────────────────────────
 
 @app.route("/collections", methods=["GET"])
 def list_collections():
@@ -420,7 +290,6 @@ def create_collection():
     if not name:
         return jsonify({"error": "name required"}), 400
 
-    import uuid
     col_id = str(uuid.uuid4())[:8]
     con    = db()
     con.execute(
@@ -446,7 +315,6 @@ def delete_collection(col_id):
     if key in INDEX_STORE:
         del INDEX_STORE[key]
 
-    import shutil
     d = _collection_dir(user_id, col_id)
     if d.exists():
         shutil.rmtree(d)
@@ -454,18 +322,16 @@ def delete_collection(col_id):
     return jsonify({"status": "deleted"})
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — INGEST
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: ingest ────────────────────────────────────────────
 
 def _ingest_text(text: str, source: str, user_id: str, collection_id: str) -> dict:
     store  = get_store(user_id, collection_id)
-    chunks = chunk_text(text, source, base_idx=len(store["chunks"]))
+    chunks = chunk_text(text, source, base_idx=len(store["chunks"]),
+                        size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
     store["chunks"].extend(chunks)
     embed_and_index(store, chunks)
     _persist_collection(user_id, collection_id)
 
-    import uuid
     con = db()
     con.execute(
         "INSERT OR REPLACE INTO documents VALUES (?,?,?,?,?,?)",
@@ -509,9 +375,7 @@ def ingest_pdf():
     return jsonify(_ingest_text(text, source, user_id, collection_id))
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — SEARCH + CHAT
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: search ────────────────────────────────────────────
 
 @app.route("/search", methods=["POST"])
 def search():
@@ -520,7 +384,6 @@ def search():
     user_id       = d.get("user_id", "default")
     collection_id = d.get("collection_id", "default")
     top_k         = int(d.get("top_k", 4))
-    history       = d.get("history", [])   # list of {role, content}
 
     if not query:
         return jsonify({"error": "query required"}), 400
@@ -534,14 +397,12 @@ def search():
     if not chunks:
         return jsonify({"answer": "Nothing relevant found.", "chunks": [], "elapsed": "0ms"})
 
-    answer  = synthesise(query, chunks, history)
+    answer  = synthesise(query, chunks)
     elapsed = f"{int((time.time() - t0) * 1000)}ms"
     return jsonify({"answer": answer, "chunks": chunks, "elapsed": elapsed})
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — DOCUMENTS (source browser)
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: documents ─────────────────────────────────────────
 
 @app.route("/documents", methods=["GET"])
 def list_documents():
@@ -575,9 +436,7 @@ def delete_document(source):
     return jsonify({"status": "deleted", "source": source})
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — SAVES (highlights)
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: saves (highlights) ────────────────────────────────
 
 @app.route("/saves", methods=["GET"])
 def list_saves():
@@ -594,7 +453,6 @@ def list_saves():
 
 @app.route("/saves", methods=["POST"])
 def create_save():
-    import uuid
     d             = request.get_json()
     user_id       = d.get("user_id", "default")
     collection_id = d.get("collection_id", "default")
@@ -636,9 +494,7 @@ def update_save(save_id):
     return jsonify({"status": "updated"})
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — STATUS / RESET
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: status / reset ────────────────────────────────────
 
 @app.route("/status", methods=["GET"])
 def status():
@@ -666,7 +522,6 @@ def reset():
     key           = index_key(user_id, collection_id)
     if key in INDEX_STORE:
         del INDEX_STORE[key]
-    import shutil
     p = _collection_dir(user_id, collection_id)
     if p.exists():
         shutil.rmtree(p)
@@ -683,17 +538,11 @@ def health():
     return jsonify({"status": "ok"})
 
 
-# ═══════════════════════════════════════════════════════════════
-#  ROUTES — USER PREFS + ONBOARDING
-# ═══════════════════════════════════════════════════════════════
+# ── Routes: user prefs + onboarding ───────────────────────────
 
 @app.route("/prefs", methods=["GET"])
 def get_prefs():
-    """
-    Returns the user's preferences and onboarding status.
-    If the user doesn't exist yet, returns onboarded: false
-    so the frontend knows to show the welcome screen.
-    """
+    """User prefs; unknown users get onboarded=false so the frontend shows the welcome screen."""
     user_id = request.args.get("user_id", "default")
     con     = db()
     row     = con.execute(
@@ -719,12 +568,7 @@ def get_prefs():
 
 @app.route("/prefs", methods=["POST"])
 def save_prefs():
-    """
-    Called when user completes onboarding.
-    Saves their vertical choice and name.
-    Also creates their default collection automatically
-    so they land directly in a working workspace.
-    """
+    """Finish onboarding: save prefs and create a first collection named after the vertical."""
     d            = request.get_json()
     user_id      = d.get("user_id", "default")
     vertical     = d.get("vertical", "")
@@ -733,7 +577,6 @@ def save_prefs():
 
     con = db()
 
-    # upsert prefs
     con.execute("""
         INSERT INTO user_prefs (user_id, onboarded, vertical, display_name, created_at, updated_at)
         VALUES (?, 1, ?, ?, ?, ?)
@@ -744,9 +587,6 @@ def save_prefs():
             updated_at   = excluded.updated_at
     """, (user_id, vertical, display_name, now, now))
 
-    # auto-create a default collection named after their vertical
-    # so they land in a real workspace immediately
-    import uuid
     vertical_names = {
         "research": "My Research",
         "finance":  "Financial Docs",
@@ -762,7 +602,6 @@ def save_prefs():
         "general":  "#c8f060"
     }.get(vertical, "#c8f060")
 
-    # only create if they don't already have one
     existing = con.execute(
         "SELECT id FROM collections WHERE user_id=? LIMIT 1", (user_id,)
     ).fetchone()
@@ -792,5 +631,6 @@ if __name__ == "__main__":
     log.info(f"FAISS:   {'✓' if FAISS_AVAILABLE else '✗'}")
     log.info(f"PDF:     {'✓' if PDF_AVAILABLE else '✗'}")
     log.info(f"Encrypt: {'✓ AES-256-GCM' if CRYPTO_AVAILABLE and ENCRYPT else '✗'}")
-    log.info("Argus embedder v3 → http://localhost:8081")
+    log.info(f"Search:  {RETRIEVAL_MODE}{' + rerank' if RERANK else ''}")
+    log.info("Argus embedder → http://localhost:8081")
     app.run(host="0.0.0.0", port=8081, debug=False)
