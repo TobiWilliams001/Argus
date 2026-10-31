@@ -139,7 +139,7 @@ The judge is itself a small local model and makes mistakes in both directions, s
 Argus is a working end-to-end prototype for a single user. Specifically:
 - **No authentication:** indexes are scoped per user and collection, but the user ID is supplied by the client and all data shares one encryption key, so it is not safe to expose to untrusted users.
 - **Evaluated on technical docs, not legal documents yet** (see [Evaluation](#evaluation)).
-- **Unit tests for retrieval only; no CI yet.**
+- **Unit tests cover retrieval only.** CI runs them and builds the Go services and frontend on every push.
 - **Crawler not yet connected** to the API or UI.
 
 ## Roadmap
@@ -150,7 +150,7 @@ Argus is a working end-to-end prototype for a single user. Specifically:
 - [ ] **Real multi-user isolation:** authentication, server-side user identity and per-user encryption keys (indexes are already namespaced per user and collection)
 - [ ] **MCP server:** expose Argus search as a tool for AI agents
 - [ ] **Connect the crawler** to the API with live progress over SSE
-- [ ] One-command `docker compose up`, tests and CI
+- [ ] One-command `docker compose up` and broader test coverage
 
 ## Project structure
 
