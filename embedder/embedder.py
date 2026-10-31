@@ -40,8 +40,8 @@ DATA_DIR = Path("./data")
 DB_PATH  = DATA_DIR / "argus.db"
 KEY_FILE = DATA_DIR / ".key"
 
-CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "500"))
-CHUNK_OVERLAP  = int(os.getenv("CHUNK_OVERLAP", "100"))
+CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP  = int(os.getenv("CHUNK_OVERLAP", "200"))
 RETRIEVAL_MODE = os.getenv("ARGUS_RETRIEVAL", "hybrid")   # vector | bm25 | hybrid
 RERANK         = os.getenv("ARGUS_RERANK", "true").lower() == "true"
 EMBED_DIM      = 384
