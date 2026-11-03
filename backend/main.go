@@ -69,6 +69,14 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// forward copies the embedder's status code and body to the client.
+func forward(w http.ResponseWriter, resp *http.Response) {
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
 func proxyJSON(w http.ResponseWriter, r *http.Request, target string) {
 	body, _ := io.ReadAll(r.Body)
 	resp, err := http.Post(target, "application/json", bytes.NewReader(body))
@@ -76,10 +84,7 @@ func proxyJSON(w http.ResponseWriter, r *http.Request, target string) {
 		http.Error(w, "embedder unavailable: "+err.Error(), 503)
 		return
 	}
-	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	forward(w, resp)
 }
 
 func proxyGet(w http.ResponseWriter, url string) {
@@ -88,9 +93,7 @@ func proxyGet(w http.ResponseWriter, url string) {
 		http.Error(w, "embedder unavailable", 503)
 		return
 	}
-	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	io.Copy(w, resp.Body)
+	forward(w, resp)
 }
 
 func proxyDelete(w http.ResponseWriter, url string) {
@@ -100,9 +103,7 @@ func proxyDelete(w http.ResponseWriter, url string) {
 		http.Error(w, "embedder unavailable", 503)
 		return
 	}
-	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	io.Copy(w, resp.Body)
+	forward(w, resp)
 }
 
 func proxyPatch(w http.ResponseWriter, r *http.Request, url string) {
@@ -114,9 +115,7 @@ func proxyPatch(w http.ResponseWriter, r *http.Request, url string) {
 		http.Error(w, "embedder unavailable", 503)
 		return
 	}
-	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	io.Copy(w, resp.Body)
+	forward(w, resp)
 }
 
 func queryString(r *http.Request) string {
@@ -182,9 +181,7 @@ func handleIngestPDF(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "embedder unavailable", 503)
 		return
 	}
-	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	io.Copy(w, resp.Body)
+	forward(w, resp)
 }
 
 func handleIngestDir(w http.ResponseWriter, r *http.Request) {
