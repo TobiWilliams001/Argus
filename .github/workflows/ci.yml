@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install numpy==1.26.4
-      - run: python -m unittest test_retrieval -v
+      - run: python -m unittest discover -p "test_*.py" -v
 
   go:
     runs-on: ubuntu-latest
