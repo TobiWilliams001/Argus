@@ -13,6 +13,7 @@ from sentence_transformers import SentenceTransformer
 
 from llm import OLLAMA_MODEL, synthesise
 from retrieval import BM25, chunk_text, search as search_chunks
+from scoping import collection_dir, valid_id
 
 try:
     import faiss
@@ -155,7 +156,7 @@ def get_store(user_id: str, collection_id: str) -> dict:
 
 
 def _collection_dir(user_id: str, collection_id: str) -> Path:
-    d = DATA_DIR / user_id / collection_id
+    d = collection_dir(DATA_DIR, user_id, collection_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -265,6 +266,22 @@ def extract_pdf_bytes(data: bytes) -> str:
     return "\n\n".join(
         p.extract_text() for p in reader.pages if p.extract_text()
     )
+
+
+# ── Routes: request validation ────────────────────────────────
+
+@app.before_request
+def reject_invalid_scope():
+    """Every route takes user_id / collection_id from the request; refuse unsafe values once, here."""
+    body = request.get_json(silent=True)
+    sources = (request.args, request.form, body if isinstance(body, dict) else {})
+    for field in ("user_id", "collection_id"):
+        for src in sources:
+            if field in src and not valid_id(src[field]):
+                return jsonify({"error": f"invalid {field}"}), 400
+    col_id = (request.view_args or {}).get("col_id")
+    if col_id is not None and not valid_id(col_id):
+        return jsonify({"error": "invalid collection_id"}), 400
 
 
 # ── Routes: collections ───────────────────────────────────────
