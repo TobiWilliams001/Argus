@@ -47,6 +47,7 @@ RETRIEVAL_MODE = os.getenv("ARGUS_RETRIEVAL", "hybrid")   # vector | bm25 | hybr
 RERANK         = os.getenv("ARGUS_RERANK", "true").lower() == "true"
 EMBED_DIM      = 384
 ENCRYPT        = os.getenv("ARGUS_ENCRYPT", "true").lower() == "true"
+HOST           = os.getenv("ARGUS_HOST", "127.0.0.1")   # 0.0.0.0 only inside a container network
 
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -649,5 +650,5 @@ if __name__ == "__main__":
     log.info(f"PDF:     {'✓' if PDF_AVAILABLE else '✗'}")
     log.info(f"Encrypt: {'✓ AES-256-GCM' if CRYPTO_AVAILABLE and ENCRYPT else '✗'}")
     log.info(f"Search:  {RETRIEVAL_MODE}{' + rerank' if RERANK else ''}")
-    log.info("Argus embedder → http://localhost:8081")
-    app.run(host="0.0.0.0", port=8081, debug=False)
+    log.info(f"Argus embedder → http://{HOST}:8081")
+    app.run(host=HOST, port=8081, debug=False)
