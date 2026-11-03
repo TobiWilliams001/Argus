@@ -55,11 +55,19 @@ func main() {
 		AllowedHeaders: []string{"Content-Type"},
 	}).Handler(mux)
 
-	fmt.Printf("Argus backend v3 → http://localhost:%s\n", PORT)
-	log.Fatal(http.ListenAndServe(":"+PORT, handler))
+	host := envOr("ARGUS_API_HOST", "127.0.0.1")
+	fmt.Printf("Argus backend → http://%s:%s\n", host, PORT)
+	log.Fatal(http.ListenAndServe(host+":"+PORT, handler))
 }
 
 // ── helpers ───────────────────────────────────────────────────
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 func proxyJSON(w http.ResponseWriter, r *http.Request, target string) {
 	body, _ := io.ReadAll(r.Body)
